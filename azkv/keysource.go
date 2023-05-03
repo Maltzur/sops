@@ -6,20 +6,15 @@ package azkv //import "go.mozilla.org/sops/v3/azkv"
 
 import (
 	"context"
-	"encoding/base64"
-	"errors"
 	"fmt"
-	"os"
 	"regexp"
 	"strings"
 	"time"
 
 	"go.mozilla.org/sops/v3/logging"
 
-	"github.com/Azure/azure-sdk-for-go/services/keyvault/2016-10-01/keyvault"
-	"github.com/Azure/go-autorest/autorest"
-	"github.com/Azure/go-autorest/autorest/azure"
-	"github.com/Azure/go-autorest/autorest/azure/auth"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/security/keyvault/azkeys"
 	"github.com/sirupsen/logrus"
 )
 
@@ -39,107 +34,22 @@ type MasterKey struct {
 	CreationDate time.Time
 }
 
-func newKeyVaultClient() (keyvault.BaseClient, error) {
+func newKeyVaultClient(vaultURL string) (*azkeys.Client, error) {
 	var err error
-	c := keyvault.New()
-	c.Authorizer, err = newAuthorizer()
+
+	cred, err := azidentity.NewDefaultAzureCredential(nil)
 	if err != nil {
 		log.WithError(err).Error("Failed to create Azure authorizer")
-		return c, err
+		return nil, err
 	}
 
-	return c, nil
-}
-
-// newAuthorizer returns the correct authorizer for the given settings and/or based on the value
-// of the AZURE_AUTH_METHOD environment variable, which may be one of:
-// clientcredentials, clientcertificate, usernamepassword, msi, or cli (default).
-func newAuthorizer() (autorest.Authorizer, error) {
-	settings := struct {
-		authMethod          string
-		tenantID            string
-		clientID            string
-		clientSecret        string
-		certificatePath     string
-		certificatePassword string
-		username            string
-		password            string
-		envName             string
-		resource            string
-		environment         azure.Environment
-	}{
-		authMethod:          os.Getenv("AZURE_AUTH_METHOD"),
-		tenantID:            os.Getenv("AZURE_TENANT_ID"),
-		clientID:            os.Getenv("AZURE_CLIENT_ID"),
-		clientSecret:        os.Getenv("AZURE_CLIENT_SECRET"),
-		certificatePath:     os.Getenv("AZURE_CERTIFICATE_PATH"),
-		certificatePassword: os.Getenv("AZURE_CERTIFICATE_PASSWORD"),
-		username:            os.Getenv("AZURE_USERNAME"),
-		password:            os.Getenv("AZURE_PASSWORD"),
-		envName:             os.Getenv("AZURE_ENVIRONMENT"),
-		resource:            os.Getenv("AZURE_AD_RESOURCE"),
+	client, err := azkeys.NewClient(vaultURL, cred, nil)
+	if err != nil {
+		log.WithError(err).Error("Failed to create Azure Key Vault client")
+		return nil, err
 	}
 
-	settings.environment = azure.PublicCloud
-	if settings.envName != "" {
-		val, err := azure.EnvironmentFromName(settings.envName)
-		if err != nil {
-			return nil, err
-		}
-		settings.environment = val
-	}
-
-	if settings.resource == "" {
-		settings.resource = strings.TrimSuffix(settings.environment.KeyVaultEndpoint, "/")
-	}
-
-	if os.Getenv("MSI_ENDPOINT") != "" {
-		settings.authMethod = "msi"
-	}
-
-	// 1. Client credentials
-	if (settings.clientSecret != "") || settings.authMethod == "clientcredentials" {
-		config := auth.NewClientCredentialsConfig(settings.clientID, settings.clientSecret, settings.tenantID)
-		config.AADEndpoint = settings.environment.ActiveDirectoryEndpoint
-		config.Resource = settings.resource
-		return config.Authorizer()
-	}
-
-	// 2. Client Certificate
-	if (settings.certificatePath != "") || settings.authMethod == "clientcertificate" {
-		config := auth.NewClientCertificateConfig(settings.certificatePath, settings.certificatePassword, settings.clientID, settings.tenantID)
-		config.AADEndpoint = settings.environment.ActiveDirectoryEndpoint
-		config.Resource = settings.resource
-		return config.Authorizer()
-	}
-
-	// 3. Username Password
-	if (settings.username != "" && settings.password != "") || settings.authMethod == "usernamepassword" {
-		config := auth.NewUsernamePasswordConfig(settings.username, settings.password, settings.clientID, settings.tenantID)
-		config.AADEndpoint = settings.environment.ActiveDirectoryEndpoint
-		config.Resource = settings.resource
-		return config.Authorizer()
-	}
-
-	// 4. MSI
-	if settings.authMethod == "msi" {
-		config := auth.NewMSIConfig()
-		config.Resource = settings.resource
-		config.ClientID = settings.clientID
-		return config.Authorizer()
-	}
-
-	// 5. Device Code
-	if settings.authMethod == "devicecode" {
-		// TODO: Removed until we decide how to handle prompt on stdout, etc.
-		//// TODO: This will be required on every execution. Consider caching.
-		//config := auth.NewDeviceFlowConfig(settings.clientID, settings.tenantID)
-		//return config.Authorizer()
-		return nil, errors.New("device code flow not implemented")
-	}
-
-	// 6. CLI
-	return auth.NewAuthorizerFromCLIWithResource(settings.resource)
+	return client, nil
 }
 
 // NewMasterKey creates a new MasterKey from an URL, key name and version, setting the creation date to the current date
@@ -197,14 +107,15 @@ func (key *MasterKey) SetEncryptedDataKey(enc []byte) {
 
 // Encrypt takes a sops data key, encrypts it with Key Vault and stores the result in the EncryptedKey field
 func (key *MasterKey) Encrypt(dataKey []byte) error {
-	c, err := newKeyVaultClient()
+	client, err := newKeyVaultClient(key.VaultURL)
 	if err != nil {
 		return err
 	}
-	data := base64.RawURLEncoding.EncodeToString(dataKey)
-	p := keyvault.KeyOperationsParameters{Value: &data, Algorithm: keyvault.RSAOAEP256}
 
-	res, err := c.Encrypt(context.Background(), key.VaultURL, key.Name, key.Version, p)
+	alg := azkeys.JSONWebKeyEncryptionAlgorithmRSAOAEP256
+	params := azkeys.KeyOperationsParameters{Value: dataKey, Algorithm: &alg}
+
+	res, err := client.Encrypt(context.Background(), key.Name, key.Version, params, nil)
 	if err != nil {
 		log.WithError(err).WithFields(logrus.Fields{
 			"key":     key.Name,
@@ -213,7 +124,7 @@ func (key *MasterKey) Encrypt(dataKey []byte) error {
 		return fmt.Errorf("Failed to encrypt data: %w", err)
 	}
 
-	key.EncryptedKey = *res.Result
+	key.EncryptedKey = string(res.Result)
 	log.WithFields(logrus.Fields{
 		"key":     key.Name,
 		"version": key.Version,
@@ -224,7 +135,7 @@ func (key *MasterKey) Encrypt(dataKey []byte) error {
 
 // EncryptIfNeeded encrypts the provided sops' data key and encrypts it if it hasn't been encrypted yet
 func (key *MasterKey) EncryptIfNeeded(dataKey []byte) error {
-	if key.EncryptedKey == "" {
+	if len(key.EncryptedKey) == 0 {
 		return key.Encrypt(dataKey)
 	}
 	return nil
@@ -232,13 +143,15 @@ func (key *MasterKey) EncryptIfNeeded(dataKey []byte) error {
 
 // Decrypt decrypts the EncryptedKey field with Azure Key Vault and returns the result.
 func (key *MasterKey) Decrypt() ([]byte, error) {
-	c, err := newKeyVaultClient()
+	client, err := newKeyVaultClient(key.VaultURL)
 	if err != nil {
 		return nil, err
 	}
-	p := keyvault.KeyOperationsParameters{Value: &key.EncryptedKey, Algorithm: keyvault.RSAOAEP256}
 
-	res, err := c.Decrypt(context.TODO(), key.VaultURL, key.Name, key.Version, p)
+	alg := azkeys.JSONWebKeyEncryptionAlgorithmRSAOAEP256
+	params := azkeys.KeyOperationsParameters{Value: []byte(key.EncryptedKey), Algorithm: &alg}
+
+	res, err := client.Decrypt(context.TODO(), key.Name, key.Version, params, nil)
 	if err != nil {
 		log.WithError(err).WithFields(logrus.Fields{
 			"key":     key.Name,
@@ -247,20 +160,11 @@ func (key *MasterKey) Decrypt() ([]byte, error) {
 		return nil, fmt.Errorf("Error decrypting key: %w", err)
 	}
 
-	plaintext, err := base64.RawURLEncoding.DecodeString(*res.Result)
-	if err != nil {
-		log.WithError(err).WithFields(logrus.Fields{
-			"key":     key.Name,
-			"version": key.Version,
-		}).Error("Decryption failed")
-		return nil, err
-	}
-
 	log.WithFields(logrus.Fields{
 		"key":     key.Name,
 		"version": key.Version,
 	}).Info("Decryption succeeded")
-	return plaintext, nil
+	return res.Result, nil
 }
 
 // NeedsRotation returns whether the data key needs to be rotated or not.
