@@ -48,6 +48,9 @@ functional-tests-all:
 	$(GO) build -o functional-tests/sops go.mozilla.org/sops/v3/cmd/sops
 	cd functional-tests && cargo test && cargo test -- --ignored
 
+build:
+	go build go.mozilla.org/sops/v3/cmd/sops
+
 # Creates variables during target re-definition. Basically this block allows the particular variables to be used in the final target
 build-deb-%: OS = $(word 1,$(subst -, ,$*))
 build-deb-%: ARCH = $(word 2,$(subst -, ,$*))
